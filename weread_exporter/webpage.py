@@ -7,48 +7,78 @@ import json
 import logging
 import os
 import random
+import re
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
+from typing import Dict, List, Optional, Union, Any, Tuple, cast
 
 import pyppeteer
 
+from . import webproxy
 from . import utils
+
+if sys.version_info >= (3, 8):
+    from typing import TYPE_CHECKING
+else:
+    from typing_extensions import TYPE_CHECKING
+
+
+DETECT_HEADLESS_SCRIPT = """
+const webdriver = navigator.webdriver === true;
+const chromeObj = typeof window.chrome !== "undefined";
+const pluginCount = navigator.plugins.length;
+const languageCount = navigator.languages ? navigator.languages.length : 0;
+const headlessUA = /HeadlessChrome/.test(navigator.userAgent);
+const zeroOuterSize = (window.outerWidth === 0 && window.outerHeight === 0);
+webdriver || !chromeObj || pluginCount === 0 || languageCount === 0  || headlessUA || zeroOuterSize;
+"""
 
 
 class WeReadWebPage(object):
     """WebRead WebPage"""
 
-    root_url = "https://weread.qq.com"
-    window_size = (1920, 1080)
+    root_url: str = "https://weread.qq.com"
+    window_size: Tuple[int, int] = (1920, 1080)
 
-    def __init__(self, book_id, cookie_path=None, webcache_path=None):
-        self._book_id = book_id
-        self._cookie_path = cookie_path
-        self._cookie = {}
-        self._webcache_path = webcache_path or "cache"
+    def __init__(
+        self,
+        book_id: str,
+        cookie_path: Optional[str] = None,
+        webcache_path: Optional[str] = None,
+    ) -> None:
+        self._book_id: str = book_id
+        self._cookie_path: Optional[str] = cookie_path
+        self._cookie: Dict[str, str] = {}
+        self._webcache_path: str = webcache_path or "cache"
         if not os.path.isdir(self._webcache_path):
             os.makedirs(self._webcache_path)
-        self._home_url = "%s/web/bookDetail/%s" % (
+        self._home_url: str = "%s/web/bookDetail/%s" % (
             self.__class__.root_url,
             book_id,
         )
-        self._chapter_root_url = self.__class__.root_url + "/web/reader/"
-        self._browser = None
-        self._page = None
+        self._chapter_root_url: str = self.__class__.root_url + "/web/reader/"
+        self._hook_script_name: str = "1.%s.js" % "".join(
+            [random.choice("0123456789abcdef") for _ in range(8)]
+        )
+        self._browser: Optional[pyppeteer.browser.Browser] = None
+        self._page: Optional[pyppeteer.page.Page] = None
         self._load_cookie()
-        self._url = ""
+        self._url: str = ""
+        self._proxy_installed: bool = False
 
-    async def get_book_info(self):
+    async def get_book_info(self) -> Dict[str, Any]:
         html = (await utils.fetch(self._home_url)).decode()
         pos1 = html.find("window.__INITIAL_STATE__")
         if pos1 <= 0:
-            raise RuntimeError("Unexpected html: %s" % self._html)
+            raise RuntimeError("Unexpected html: %s" % html)
         pos1 = html.find("=", pos1)
         pos2 = html.find("};", pos1)
         data = html[pos1 + 1 : pos2 + 1].strip()
         data = json.loads(data)
-        book_info = {}
+        book_info: Dict[str, Any] = {}
         book_info["title"] = data["reader"]["bookInfo"]["title"]
         book_info["author"] = data["reader"]["bookInfo"]["author"]
         book_info["cover"] = data["reader"]["bookInfo"]["cover"]
@@ -68,18 +98,22 @@ class WeReadWebPage(object):
             book_info["chapters"].append(chap)
         return book_info
 
-    async def get_user_info(self):
-        vid = self._cookie.get("wr_vid")
+    async def get_user_info(self) -> Dict[str, Any]:
+        vid: str = self._cookie.get("wr_vid", "")
         if not vid:
             raise utils.InvalidUserError("Invalid cookie: %s" % self._format_cookie())
-        url = "%s/web/user?userVid=%s" % (self.__class__.root_url, vid)
-        headers = {"Referer": self.__class__.root_url, "Cookie": self._format_cookie()}
-        rsp = await utils.fetch(url, headers=headers)
-        rsp = json.loads(rsp.decode())
-        if rsp.get("errCode") == -2012:
-            _, rsp_headers, _ = await utils.fetch(
+        url: str = "%s/web/user?userVid=%s" % (self.__class__.root_url, vid)
+        headers: Dict[str, str] = {
+            "Referer": self.__class__.root_url,
+            "Cookie": self._format_cookie(),
+        }
+        rsp: bytes = await utils.fetch(url, headers=headers)
+        rsp_data = json.loads(rsp.decode())
+        if rsp_data.get("errCode") == -2012:
+            result = await utils.fetch(
                 self.__class__.root_url, headers=headers, respond_with_headers=True
             )
+            _, rsp_headers, _ = cast(Tuple[int, Dict[str, str], bytes], result)
             for it in rsp_headers.getall("Set-Cookie", []):
                 cookie = it.split("; ")[0]
                 if "=" not in cookie:
@@ -96,64 +130,64 @@ class WeReadWebPage(object):
             self._save_cookie()
             headers["Cookie"] = self._format_cookie()
             rsp = await utils.fetch(url, headers=headers)
-            rsp = json.loads(rsp.decode())
-        elif rsp.get("errCode") == -2010:
+            rsp_data = json.loads(rsp.decode())
+        elif rsp_data.get("errCode") == -2010:
             # 用户不存在
             raise utils.InvalidUserError("User %s not found" % vid)
-        elif rsp.get("errCode"):
-            raise RuntimeError("Get user info failed: %s" % rsp)
-        return rsp
+        elif rsp_data.get("errCode"):
+            raise RuntimeError("Get user info failed: %s" % rsp_data)
+        return rsp_data
 
-    def _load_cookie(self):
+    def _load_cookie(self) -> None:
         self._cookie = {}
-        if not os.path.isfile(self._cookie_path):
+        if not self._cookie_path or not os.path.isfile(self._cookie_path):
             return
         with open(self._cookie_path) as fp:
             cookie = fp.read()
             try:
-                cookie = json.loads(cookie)
+                cookie_data: Dict[str, str] = json.loads(cookie)
             except:
                 for it in cookie.split(";"):
                     it = it.strip()
                     if "=" not in it:
                         continue
-                    key, value = it.split("=")
+                    key, value = it.split("=", 1)
                     self._cookie[key] = value
             else:
-                for key in cookie:
-                    self._cookie[key] = cookie[key]
+                for key in cookie_data:
+                    self._cookie[key] = cookie_data[key]
 
-    def _save_cookie(self):
+    def _save_cookie(self) -> None:
         if not self._cookie_path:
             return
         with open(self._cookie_path, "w") as fp:
             fp.write(json.dumps(self._cookie))
 
-    def _format_cookie(self, cookie=""):
-        cookies = []
+    def _format_cookie(self, cookie: str = "") -> str:
+        cookies: List[str] = []
         if cookie:
             cookies.append(cookie)
         for key in self._cookie:
             cookies.append("%s=%s" % (key, self._cookie[key]))
         return "; ".join(cookies)
 
-    async def _read_cookie(self):
+    async def _read_cookie(self) -> Dict[str, str]:
         cookies = await self._page.cookies()
         cookie_map = {}
         for cookie in cookies:
             cookie_map[cookie["name"]] = cookie["value"]
         return cookie_map
 
-    async def _update_cookie(self):
+    async def _update_cookie(self) -> None:
         self._cookie = await self._read_cookie()
 
-    async def check_valid(self):
+    async def check_valid(self) -> bool:
         html = await utils.fetch(self._home_url)
         if b'"soldout":1' in html:
             return False
         return True
 
-    def _check_chrome(self):
+    def _check_chrome(self) -> str:
         path_list = os.environ["PATH"].split(";" if sys.platform == "win32" else ":")
         for chrome in ("chrome", "google-chrome"):
             if sys.platform == "win32":
@@ -176,25 +210,58 @@ class WeReadWebPage(object):
             % command
         )
 
+    def _get_chrome_version(self, chrome_path: str) -> Optional[int]:
+        """获取 Chrome 版本号的主版本号"""
+        try:
+            # 尝试获取 Chrome 版本
+            result = subprocess.run(
+                [chrome_path, "--version"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                # 解析版本号，格式通常是 "Google Chrome 136.0.6776.0" 或 "Chromium 136.0.6776.0"
+                version_match = re.search(r"(\d+)\.", result.stdout)
+                if version_match:
+                    return int(version_match.group(1))
+        except (
+            subprocess.TimeoutExpired,
+            subprocess.SubprocessError,
+            FileNotFoundError,
+            ValueError,
+        ):
+            # 如果获取版本失败，返回 None
+            pass
+        return None
+
     async def launch(
         self,
-        headless=False,
-        force_login=False,
-        use_default_profile=False,
-        mock_user_agent=False,
-        proxy_server=None
-    ):
+        headless: bool = False,
+        force_login: bool = False,
+        use_default_profile: bool = False,
+        mock_user_agent: bool = False,
+        proxy_server: Optional[str] = None,
+    ) -> None:
         logging.info("[%s] Launch url %s" % (self.__class__.__name__, self._home_url))
-        chrome = self._check_chrome()
+        chrome: str = self._check_chrome()
+
+        # 检查 Chrome 版本并在使用默认 profile 时发出警告
+        if use_default_profile:
+            chrome_version = self._get_chrome_version(chrome)
+            if chrome_version is not None and chrome_version >= 136:
+                logging.warning(
+                    "[%s] Chrome %d detected. Chrome 136+ no longer supports using default profile. Consider using --use-default-profile=false to avoid potential issues."
+                    % (self.__class__.__name__, chrome_version)
+                )
+
         args = ["--no-first-run", "--remote-allow-origins=*"]
         if headless:
-            args.append("--headless")
+            args.append("--headless=new")
             if sys.platform == "linux" and os.getuid() == 0:
                 args.append("--no-sandbox")
         if use_default_profile:
             args.append("--user-data-dir")
         else:
             args.append("--window-size=%d,%d" % self.__class__.window_size)
+            args.append("--user-data-dir=%s" % tempfile.mkdtemp())
         if mock_user_agent:
             args.append('--user-agent="%s"' % utils.generate_user_agent())
         if proxy_server:
@@ -217,7 +284,7 @@ class WeReadWebPage(object):
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => {
                         console.log('navigator.webdriver is called');
-                        console.trace();
+                        console.log(new Error().stack);
                         return undefined;
                     }
                 });
@@ -225,7 +292,7 @@ class WeReadWebPage(object):
                 Object.prototype.hasOwnProperty = function (key) {
                     if (key === 'webdriver') {
                         console.log('hasOwnProperty', key, 'is called');
-                        console.trace();
+                        console.log(new Error().stack);
                         return false;
                     }
                     return _hasOwnProperty.call(this, key);
@@ -264,6 +331,12 @@ class WeReadWebPage(object):
                 "deviceScaleFactor": 0.3,
             }
         )
+        detect_headless_result = await self._page.evaluate(DETECT_HEADLESS_SCRIPT)
+        if detect_headless_result:
+            key = input("浏览器检测到Headless模式，继续执行可能导致帐号被封禁，是否继续执行？Y/n\n")
+            if key != "Y":
+                raise utils.BreakExportingError()
+
         if self._cookie.get("wr_vid"):
             try:
                 user_info = await self.get_user_info()
@@ -288,20 +361,20 @@ class WeReadWebPage(object):
             await self.wait_for_avatar()
         self._page.on("console", self.handle_log)
 
-    async def close(self):
+    async def close(self) -> None:
         if self._browser:
             await self._browser.close()
             self._browser = self._page = None
 
-    async def get_html(self):
+    async def get_html(self) -> str:
         return await self._page.evaluate("document.documentElement.outerHTML;")
 
-    async def screenshot(self, save_path):
+    async def screenshot(self, save_path: str) -> None:
         await self._page.screenshot({"path": save_path})
 
-    async def wait_for_selector(self, selector, timeout=30):
+    async def wait_for_selector(self, selector: str, timeout: int = 30) -> Any:
         try:
-            return await self._page.waitForSelector(selector, timeout=timeout)
+            return await self._page.waitForSelector(selector, timeout=timeout * 1000)
         except pyppeteer.errors.TimeoutError as ex:
             html = await self.get_html()
             html_path = "webpage.html"
@@ -320,11 +393,13 @@ class WeReadWebPage(object):
             )
             raise ex
 
-    def handle_log(self, message):
+    def handle_log(self, message: Any) -> None:
+        text = message.text
+        logging.info("[%s][Console] %s" % (self.__class__.__name__, text))
         with open("%s.log" % self._book_id, "a+", encoding="utf-8") as fp:
-            fp.write("[%s] %s\n" % (self._url, message.text))
+            fp.write("[%s] %s\n" % (self._url, text))
 
-    async def wait_for_avatar(self, timeout=30):
+    async def wait_for_avatar(self, timeout: int = 30) -> None:
         time0 = time.time()
         while time.time() - time0 < timeout:
             avatar_url = await self._page.evaluate(
@@ -336,7 +411,7 @@ class WeReadWebPage(object):
         else:
             raise RuntimeError("Wait for avatar timeout")
 
-    async def _inject_cookie(self):
+    async def _inject_cookie(self) -> None:
         for key in self._cookie:
             logging.info(
                 "[%s] Inject cookie %s=%s"
@@ -351,7 +426,7 @@ class WeReadWebPage(object):
                 }
             )
 
-    async def login(self):
+    async def login(self) -> bool:
         selectors = [
             "button.navBar_link_Login",
             "div.readerTopBar_right button.actionItem",
@@ -383,175 +458,160 @@ class WeReadWebPage(object):
                 raise RuntimeError("Login timeout")
         return False
 
-    async def _get_from_cache_or_server(self, url, headers=None):
-        u = urllib.parse.urlparse(url)
+    async def _get_from_cache_or_server(
+        self, url: str, headers: Optional[Dict[str, str]] = None
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        u: urllib.parse.ParseResult = urllib.parse.urlparse(url)
         path = os.path.join(
             self._webcache_path, "resources", u.path[1:].replace("/", os.sep)
         )
         if os.path.isfile(path):
+            logging.info(
+                "[%s] Url %s hit cache %d"
+                % (self.__class__.__name__, url, os.path.getsize(path))
+            )
             with open(path, "rb") as fp:
                 return 200, {}, fp.read()
 
         dirpath = os.path.dirname(path)
         if not os.path.isdir(dirpath):
             os.makedirs(dirpath)
-        status, headers, body = await utils.fetch(
-            url, headers=headers, respond_with_headers=True
-        )
+        result = await utils.fetch(url, headers=headers, respond_with_headers=True)
+        # 当 respond_with_headers=True 时，返回类型确定是 Tuple[int, Dict[str, str], bytes]
+        status, headers_resp, body = cast(Tuple[int, Dict[str, str], bytes], result)
+        logging.info("[%s] Url %s return %d" % (self.__class__.__name__, url, status))
         if status == 200:
             with open(path, "wb") as fp:
                 fp.write(body)
-        return status, headers, body
+        return status, headers_resp, body
 
-    def _handle_request_headers(self, url, headers):
-        for key in ("baggage", "sentry-trace"):
-            headers.pop(key, None)
-        cookie = ""
-        if "/web/reader/" in url:
-            cookie = "wr_useHorizonReader=0"
-        headers["cookie"] = self._format_cookie(cookie)
-        return headers
-
-    def _handle_response_headers(self, url, headers):
-        if "oss.weread.qq.com" in url:
-            headers["Access-Control-Allow-Origin"] = "*"
-            headers["Access-Control-Request-Method"] = "*"
-            headers["Access-Control-Allow-Headers"] = "*"
-        return headers
-
-    def _handle_http_body(self, url, body):
-        if url.startswith(self._chapter_root_url):
-            inject_script = (
-                "<script src='https://cdn.weread.qq.com/web/1.392ec47a.js'></script>\n"
+    def _log_request(self, request: "webproxy.WebRequest") -> None:
+        if request.method == "POST":
+            message = "[%s] %s %s" % (
+                self.__class__.__name__,
+                request.method,
+                request.url,
             )
-            return body.replace(b"</head>", inject_script.encode() + b"</head>")
-        return body
+            if request.body:
+                message += " %s" % request.content
+            logging.info(message)
 
-    async def _handle_request(self, request):
-        if request.url.startswith("chrome-extension://"):
-            return await request.continue_()
+    def on_document_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
+        """ """
+        cookie = request.headers.get("cookie", "")
+        cookie += "; wr_useHorizonReader=0"
+        request.headers["cookie"] = cookie
+        return {"type": webproxy.EnumProxyType.Continue, "headers": request.headers}
 
-        if "/web/1.392ec47a.js" in request.url:
-            with open(
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.js"),
-                "rb",
-            ) as fp:
-                hook_script = fp.read()
-                response = {
-                    "status": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": hook_script,
-                }
-                return await request.respond(response)
-
-        urlobj = urllib.parse.urlparse(request.url)
-        is_resource_file = urlobj.path.endswith(
-            (".js", ".css", ".jpg", ".png", ".gif", ".svg")
+    def on_document_response(self, response: "webproxy.WebResponse") -> Dict[str, Any]:
+        content = response.content
+        inject_script = (
+            "<script src='https://cdn.weread.qq.com/web/%s'></script>\n"
+            % self._hook_script_name
         )
-        status = 200
-        headers = {
-            "Server": "nginx/1.20.2",
+        content = content.replace("</head>", inject_script + "</head>")
+        return {
+            "status": response.status,
+            "headers": response.headers,
+            "body": content.encode("utf-8"),
         }
-        body = b""
+
+    def on_hook_script_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
+        with open(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.js"),
+            "rb",
+        ) as fp:
+            hook_script = fp.read()
+            return {
+                "type": webproxy.EnumProxyType.Mock,
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": hook_script,
+            }
+
+    def on_log_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
+        self._log_request(request)
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Request-Method": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
         if request.method == "OPTIONS":
-            headers = {
+            return {
+                "type": webproxy.EnumProxyType.Mock,
+                "status": 200,
+                "headers": headers,
+            }
+        if "/hera/logkv" in request.url or "/hera/osslog" in request.url:
+            return {
+                "type": webproxy.EnumProxyType.Mock,
+                "status": 204,
+                "headers": headers,
+            }
+        elif "chlog" in request.url:
+            logging.info("[%s] Url %s return mock result" % (self.__class__.__name__, request.url))
+            return {
+                "type": webproxy.EnumProxyType.Mock,
+                "status": 200,
+                "headers": headers,
+            }
+        return {"type": webproxy.EnumProxyType.Block}
+
+    def on_sentry_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
+        self._log_request(request)
+        return {
+            "type": webproxy.EnumProxyType.Mock,
+            "status": 200,
+        }
+
+    def on_single_report_request(
+        self, request: "webproxy.WebRequest"
+    ) -> Dict[str, Any]:
+        self._log_request(request)
+        return {
+            "type": webproxy.EnumProxyType.Mock,
+            "status": 200,
+            "headers": {
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Request-Method": "*",
                 "Access-Control-Allow-Headers": "*",
-            }
-        elif request.method == "GET" and is_resource_file:
-            status, headers, body = await self._get_from_cache_or_server(request.url)
-        elif "/web/book/read" in request.url:
-            body = b'{"succ":1,"synckey":%d}' % random.randint(10000000, 100000000)
-            headers["Content-Type"] = "application/json; charset=utf-8"
-            headers["Content-Length"] = str(len(body))
-            logging.info(
-                "[%s][%s] Url %s return mock data"
-                % (self.__class__.__name__, request.method, request.url)
-            )
-        elif "sentry_key=" in request.url:
-            status = 200
-            headers["Content-Type"] = "application/json; charset=utf-8"
-            headers["Content-Length"] = str(len(body))
-            body = b"{}"
-            logging.info(
-                "[%s][%s] Url %s return mock data"
-                % (self.__class__.__name__, request.method, request.url)
-            )
-        elif "/hera/logkv" in request.url or "/hera/osslog" in request.url:
-            status = 204
-        elif "/hera/chlog" in request.url:
-            body = b'{"ret":0}'
-            headers["Content-Type"] = "application/json; charset=utf-8"
-            headers["Content-Length"] = str(len(body))
-            logging.info(
-                "[%s][%s] Url %s return mock data"
-                % (self.__class__.__name__, request.method, request.url)
-            )
-        elif "hijack_csp_report" in request.url:
-            return
-        elif "/river/single" in request.url:
-            body = b'{"err_code":0,"msg":"suc"}'
-            headers["Content-Type"] = "application/json; charset=utf-8"
-            headers["Content-Length"] = len(body)
-            logging.info(
-                "[%s][%s] Url %s return mock data"
-                % (self.__class__.__name__, request.method, request.url)
-            )
-        else:
-            logging.info(
-                "[%s][%s] Fetch url %s"
-                % (self.__class__.__name__, request.method, request.url)
-            )
-            headers = self._handle_request_headers(request.url, request.headers)
-            time0 = time.time()
-            status, headers, body = await utils.fetch(
-                request.url,
-                method=request.method,
-                headers=headers,
-                data=request.postData,
-                respond_with_headers=True,
-            )
-            headers = dict(headers)
-            logging.info(
-                "[%s][%s][%.2f] Url %s return %d, body len is %d"
-                % (
-                    self.__class__.__name__,
-                    request.method,
-                    time.time() - time0,
-                    request.url,
-                    status,
-                    len(body),
-                )
-            )
-            if "Content-Security-Policy" in headers:
-                logging.info(
-                    "[%s][%s] Url %s has Content-Security-Policy: %s"
-                    % (
-                        self.__class__.__name__,
-                        request.method,
-                        request.url,
-                        headers["Content-Security-Policy"],
-                    )
-                )
-                headers.pop("Content-Security-Policy")
-
-        headers = self._handle_response_headers(request.url, headers)
-        response = {
-            "status": status,
-            "headers": headers,
-            "body": self._handle_http_body(request.url, body),
+            },
+            "body": '{"err_code":0,"msg":"suc"}',
         }
-        return await request.respond(response)
 
-    def handle_request(self, request):
-        asyncio.ensure_future(self._handle_request(request))
+    def on_chapter_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
+        return {"type": webproxy.EnumProxyType.Continue}
 
-    async def pre_load_page(self):
-        await self._page.setRequestInterception(True)
-        self._page.on("request", self.handle_request)
+    async def pre_load_page(self) -> None:
+        if self._proxy_installed:
+            return
+        self._proxy_installed = True
+        # await self._page.setRequestInterception(True)
+        rules = [
+            webproxy.ProxyRule("*/hera/*", self.on_log_request),
+            webproxy.ProxyRule("*/sentry/*", self.on_sentry_request),
+            webproxy.ProxyRule("*/web/book/chapter/*", self.on_chapter_request),
+            webproxy.ProxyRule("*/river/single*", self.on_single_report_request),
+            webproxy.ProxyRule(
+                "*/web/reader/*", self.on_document_request, resource_type="Document"
+            ),
+            webproxy.ProxyRule(
+                "*/web/reader/*",
+                self.on_document_response,
+                resource_type="Document",
+                stage=webproxy.EnumProxyStage.Response,
+            ),
+            webproxy.ProxyRule(
+                "*/web/%s" % self._hook_script_name,
+                self.on_hook_script_request,
+                resource_type="Script",
+            ),
+        ]
+        proxy = webproxy.WebProxy(self._page, rules)
+        await proxy.setup_interception()
+        # self._page.on("request", self.handle_request)
 
-    async def get_markdown(self):
+    async def get_markdown(self) -> str:
         script = "canvasContextHandler.data.complete;"
         time0 = time.time()
         while time.time() - time0 < 10:
@@ -568,12 +628,10 @@ class WeReadWebPage(object):
                 raise RuntimeError("Wait for creating markdown timeout")
         return result
 
-    async def _check_next_page(self):
+    async def _check_next_page(self) -> None:
         while True:
             try:
-                await self.wait_for_selector(
-                    "button.readerFooter_button", timeout=60000
-                )
+                await self.wait_for_selector("button.readerFooter_button", timeout=60)
             except pyppeteer.errors.TimeoutError:
                 logging.info("[%s] load selector timeout " % self.__class__.__name__)
                 break
@@ -595,14 +653,14 @@ class WeReadWebPage(object):
             else:
                 raise NotImplementedError(result)
 
-    def _get_chapter_url(self, chapter_id):
+    def _get_chapter_url(self, chapter_id: str) -> str:
         return "%s%sk%s" % (
             self._chapter_root_url,
             self._book_id,
             utils.wr_hash(str(chapter_id)),
         )
 
-    async def goto_chapter(self, chapter_id, timeout=120):
+    async def goto_chapter(self, chapter_id: str, timeout: int = 120) -> None:
         logging.info("[%s] Go to chapter %s" % (self.__class__.__name__, chapter_id))
         # await self.clear_cache()
         await self.pre_load_page()
@@ -614,5 +672,5 @@ class WeReadWebPage(object):
             await self.login()
             return await self.goto_chapter(chapter_id, timeout=timeout)
 
-    async def clear_cache(self):
+    async def clear_cache(self) -> None:
         await self._page.evaluate("canvasContextHandler.clearCanvasCache();")
