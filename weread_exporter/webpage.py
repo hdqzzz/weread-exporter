@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
 import subprocess
 import sys
@@ -60,14 +59,58 @@ class WeReadWebPage(object):
             book_id,
         )
         self._chapter_root_url: str = self.__class__.root_url + "/web/reader/"
-        self._hook_script_name: str = "1.%s.js" % "".join(
-            [random.choice("0123456789abcdef") for _ in range(8)]
-        )
         self._browser: Optional[pyppeteer.browser.Browser] = None
         self._page: Optional[pyppeteer.page.Page] = None
         self._load_cookie()
         self._url: str = ""
         self._proxy_installed: bool = False
+
+    def _load_hook_script(self) -> str:
+        hook_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "hook.js"
+        )
+        with open(hook_path, encoding="utf-8") as fp:
+            return fp.read()
+
+    async def _install_hook_on_new_document(self) -> None:
+        hook_script = self._load_hook_script().replace(
+            "let canvasContextHandler = {",
+            "window.canvasContextHandler = {",
+            1,
+        )
+        await self._page.evaluateOnNewDocument(
+            "() => {\n"
+            "if (window.__wereadExporterHookInstalled) return;\n"
+            "%s\n"
+            "window.__wereadExporterHookInstalled = true;\n"
+            "}" % hook_script
+        )
+
+    async def _has_canvas_hook(self) -> bool:
+        try:
+            return bool(
+                await self._page.evaluate(
+                    "typeof canvasContextHandler !== 'undefined';"
+                )
+            )
+        except Exception:
+            logging.warning(
+                "[%s] Failed to check canvas hook" % self.__class__.__name__,
+                exc_info=True,
+            )
+            return False
+
+    async def _ensure_hook_available(self) -> None:
+        if await self._has_canvas_hook():
+            return
+        logging.warning(
+            "[%s] Canvas hook missing, reinstall and reload page"
+            % self.__class__.__name__
+        )
+        await self._install_hook_on_new_document()
+        await self._page.reload()
+        if not await self._has_canvas_hook():
+            raise utils.LoadChapterFailedError("Canvas hook is unavailable")
 
     async def get_book_info(self) -> Dict[str, Any]:
         html = (await utils.fetch(self._home_url)).decode()
@@ -278,6 +321,7 @@ class WeReadWebPage(object):
             logLevel=logging.INFO,
         )
         self._page = (await self._browser.pages())[0]
+        await self._install_hook_on_new_document()
         await self._page.evaluateOnNewDocument(
             """() => {
             if (navigator.webdriver) {
@@ -503,32 +547,6 @@ class WeReadWebPage(object):
         request.headers["cookie"] = cookie
         return {"type": webproxy.EnumProxyType.Continue, "headers": request.headers}
 
-    def on_document_response(self, response: "webproxy.WebResponse") -> Dict[str, Any]:
-        content = response.content
-        inject_script = (
-            "<script src='https://cdn.weread.qq.com/web/%s'></script>\n"
-            % self._hook_script_name
-        )
-        content = content.replace("</head>", inject_script + "</head>")
-        return {
-            "status": response.status,
-            "headers": response.headers,
-            "body": content.encode("utf-8"),
-        }
-
-    def on_hook_script_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        with open(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.js"),
-            "rb",
-        ) as fp:
-            hook_script = fp.read()
-            return {
-                "type": webproxy.EnumProxyType.Mock,
-                "status": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": hook_script,
-            }
-
     def on_log_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
         self._log_request(request)
         headers = {
@@ -595,41 +613,39 @@ class WeReadWebPage(object):
             webproxy.ProxyRule(
                 "*/web/reader/*", self.on_document_request, resource_type="Document"
             ),
-            webproxy.ProxyRule(
-                "*/web/reader/*",
-                self.on_document_response,
-                resource_type="Document",
-                stage=webproxy.EnumProxyStage.Response,
-            ),
-            webproxy.ProxyRule(
-                "*/web/%s" % self._hook_script_name,
-                self.on_hook_script_request,
-                resource_type="Script",
-            ),
         ]
         proxy = webproxy.WebProxy(self._page, rules)
         await proxy.setup_interception()
         # self._page.on("request", self.handle_request)
 
     async def get_markdown(self) -> str:
+        if not await self._has_canvas_hook():
+            raise utils.LoadChapterFailedError("Canvas hook is unavailable")
         script = "canvasContextHandler.data.complete;"
-        time0 = time.time()
-        while time.time() - time0 < 10:
-            result = await self._page.evaluate(script)
-            if result:
-                break
-            await asyncio.sleep(1)
-        script = "canvasContextHandler.data.markdown;"
-        result = await self._page.evaluate(script)
-        if not result:
-            await self._page.evaluate("canvasContextHandler.updateMarkdown();")
+        try:
+            time0 = time.time()
+            while time.time() - time0 < 10:
+                result = await self._page.evaluate(script)
+                if result:
+                    break
+                await asyncio.sleep(1)
+            script = "canvasContextHandler.data.markdown;"
             result = await self._page.evaluate(script)
             if not result:
-                raise RuntimeError("Wait for creating markdown timeout")
+                await self._page.evaluate("canvasContextHandler.updateMarkdown();")
+                result = await self._page.evaluate(script)
+        except Exception as ex:
+            raise utils.LoadChapterFailedError(
+                "Read markdown from canvas hook failed"
+            ) from ex
+        if not result:
+            raise utils.LoadChapterFailedError("Wait for creating markdown timeout")
         return result
 
     async def _check_next_page(self) -> None:
         while True:
+            if not await self._has_canvas_hook():
+                raise utils.LoadChapterFailedError("Canvas hook is unavailable")
             try:
                 await self.wait_for_selector("button.readerFooter_button", timeout=60)
             except pyppeteer.errors.TimeoutError:
@@ -666,6 +682,7 @@ class WeReadWebPage(object):
         await self.pre_load_page()
         self._url = self._get_chapter_url(chapter_id)
         await self._page.goto(self._url, timeout=1000 * timeout)
+        await self._ensure_hook_available()
         try:
             await self._check_next_page()
         except utils.LoginRequiredError:
