@@ -19,6 +19,7 @@ __pycache__/
 .Python
 .env
 .venv
+.worktrees/
 env/
 venv/
 ENV/
