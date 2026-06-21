@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 from aiohttp.client import _RequestContextManager
+from multidict import CIMultiDict
 from PIL import Image
 
 if sys.version_info >= (3, 8):
@@ -116,7 +117,7 @@ async def fetch(
     headers: Optional[Dict[str, str]] = None,
     data: Optional[Union[str, bytes]] = None,
     respond_with_headers: bool = False,
-) -> Union[bytes, Tuple[int, Dict[str, str], bytes]]:
+) -> Union[bytes, Tuple[int, CIMultiDict[str], bytes]]:
     headers: Dict[str, str] = headers or {}
     headers.pop("sec-ch-ua", None)
     headers.pop("sec-ch-ua-platform", None)
@@ -133,9 +134,8 @@ async def fetch(
                     # response.raise_for_status()
                     result = await response.read()
                     if respond_with_headers:
-                        # 转换 headers 为字典以匹配类型注解
-                        headers_dict = {k: v for k, v in response.headers.items()}
-                        return response.status, headers_dict, result
+                        headers_copy = CIMultiDict(response.headers)
+                        return response.status, headers_copy, result
                     else:
                         return result
             except:

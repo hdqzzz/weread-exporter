@@ -10,6 +10,7 @@ import traceback
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable, Awaitable, cast  # pyright: ignore[reportDeprecated]
 
 import pyppeteer
+from multidict import CIMultiDict, MultiMapping
 
 from . import utils
 
@@ -304,7 +305,7 @@ class WebResponse:
     """Web请求响应类"""
 
     def __init__(
-        self, request: WebRequest, status: int, headers: Dict[str, str], body: bytes  # pyright: ignore[reportDeprecated]
+        self, request: WebRequest, status: int, headers: MultiMapping[str], body: bytes  # pyright: ignore[reportDeprecated]
     ) -> None:
         """初始化
 
@@ -437,7 +438,7 @@ class WebProxy(object):
                 respond_with_headers=True,
             )
             status, response_headers, body = cast(
-                Tuple[int, Dict[str, str], bytes], result  # pyright: ignore[reportDeprecated]
+                Tuple[int, CIMultiDict[str], bytes], result  # pyright: ignore[reportDeprecated]
             )
 
             # 返回 WebResponse 对象

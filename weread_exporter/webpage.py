@@ -15,6 +15,7 @@ import urllib.parse
 from typing import Dict, List, Optional, Union, Any, Tuple, cast
 
 import pyppeteer
+from multidict import CIMultiDict
 
 from . import webproxy
 from . import utils
@@ -156,7 +157,9 @@ class WeReadWebPage(object):
             result = await utils.fetch(
                 self.__class__.root_url, headers=headers, respond_with_headers=True
             )
-            _, rsp_headers, _ = cast(Tuple[int, Dict[str, str], bytes], result)
+            _, rsp_headers, _ = cast(
+                Tuple[int, CIMultiDict[str], bytes], result
+            )
             for it in rsp_headers.getall("Set-Cookie", []):
                 cookie = it.split("; ")[0]
                 if "=" not in cookie:
@@ -504,7 +507,7 @@ class WeReadWebPage(object):
 
     async def _get_from_cache_or_server(
         self, url: str, headers: Optional[Dict[str, str]] = None
-    ) -> Tuple[int, Dict[str, str], bytes]:
+    ) -> Tuple[int, CIMultiDict[str], bytes]:
         u: urllib.parse.ParseResult = urllib.parse.urlparse(url)
         path = os.path.join(
             self._webcache_path, "resources", u.path[1:].replace("/", os.sep)
@@ -515,14 +518,15 @@ class WeReadWebPage(object):
                 % (self.__class__.__name__, url, os.path.getsize(path))
             )
             with open(path, "rb") as fp:
-                return 200, {}, fp.read()
+                return 200, CIMultiDict(), fp.read()
 
         dirpath = os.path.dirname(path)
         if not os.path.isdir(dirpath):
             os.makedirs(dirpath)
         result = await utils.fetch(url, headers=headers, respond_with_headers=True)
-        # 当 respond_with_headers=True 时，返回类型确定是 Tuple[int, Dict[str, str], bytes]
-        status, headers_resp, body = cast(Tuple[int, Dict[str, str], bytes], result)
+        status, headers_resp, body = cast(
+            Tuple[int, CIMultiDict[str], bytes], result
+        )
         logging.info("[%s] Url %s return %d" % (self.__class__.__name__, url, status))
         if status == 200:
             with open(path, "wb") as fp:
